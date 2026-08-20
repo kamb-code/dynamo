@@ -651,7 +651,6 @@ async fn apply_structural_tag_jail_with_parser_and_choice(
         tool_choice,
         None,
         true,
-        false,
         input,
     )
     .filter_map(|a| async move {

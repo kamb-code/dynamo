@@ -3875,7 +3875,7 @@ impl OpenAIPreprocessor {
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
         use dynamo_parsers::tool_calling::jail::{
-            Annotated as JailAnnotated, apply_tool_calling_jail as jail_apply,
+            Annotated as JailAnnotated, apply_tool_calling_jail_with_guided_streaming as jail_apply,
         };
         use std::sync::{Arc, Mutex};
 
