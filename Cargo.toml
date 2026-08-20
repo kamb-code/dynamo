@@ -74,7 +74,11 @@ dynamo-parsers = { version = "8.0.0" }
 # Published on crates.io. To see all available versions:
 #   web:          https://crates.io/crates/dynamo-parsers-v2/versions
 #   sparse index: curl https://index.crates.io/dy/na/dynamo-parsers-v2   (one JSON line per release; read the "vers" field)
-dynamo-parsers-v2 = { version = "0.1.23" }
+# TEMPORARY PIN — replace with `dynamo-parsers-v2 = { version = "0.3.0" }` once
+# frontend-crates#190 is released. `StreamBestEffort` does not exist in 0.2.1, and
+# a `^0.2.1` requirement would not float to 0.3.0 anyway, so the version bump and
+# all three lockfiles must move together at that point.
+dynamo-parsers-v2 = { git = "https://github.com/ai-dynamo/frontend-crates.git", branch = "keivenchang/DIS-2701__scanner-base-params" }
 dynamo-backend-common = { path = "lib/backend-common", version = "1.5.0" }
 dynamo-sidecar-common = { path = "lib/sidecar/common", version = "1.5.0" }
 fastokens = { version = "0.2.0" }

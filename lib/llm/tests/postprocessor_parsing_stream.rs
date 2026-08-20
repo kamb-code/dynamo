@@ -4502,3 +4502,392 @@ async fn postprocessor_parsing_stream_force_nonempty_whitespace_only_turn_surviv
         "whitespace-only output must not vanish for a force_nonempty_content request"
     );
 }
+
+// Guided tool-call routing matrix.
+//
+// For a forced `tool_choice` (`Required` or `Named`), a per-choice pre-commit
+// classifier buffers the stream until the first non-whitespace byte arrives.
+// `[` (required) or `{` (named) means the model is emitting guided JSON, so the
+// request streams as guided JSON. Anything else means NATIVE markup, and the
+// buffer is replayed UNTOUCHED into the existing v1 jail. Nothing may be emitted
+// before that decision is made.
+//
+// | # | Row                                                        | Proves                                                                        |
+// |---|------------------------------------------------------------|-------------------------------------------------------------------------------|
+// | 1 | minimax_m2 + required + native XML (thinking disabled)      | NATIVE classification does not break the existing v1 jail extraction (regression) |
+// | 2 | minimax_m2 + required + reasoning then native XML           | NATIVE replay preserves the pre-`</think>` reasoning split                     |
+// | 3 | qwen3_coder + required + guided JSON array                  | leading `[` under Required routes to guided JSON, args stay valid JSON         |
+// | 4 | qwen3_coder + named + bare guided arguments object          | leading `{` under Named routes to guided JSON, name comes from the request     |
+// | 5 | qwen3_coder + required + whitespace then guided array       | leading whitespace is skipped, classification lands on the first real byte     |
+// | 6 | minimax_m2 + required + native XML containing a later `{`   | only the FIRST non-whitespace byte classifies; an inner brace stays NATIVE     |
+// | 7 | qwen3_coder + required + whitespace-only first chunk        | classification survives a chunk boundary and lands on the later `[`            |
+
+/// Row 1 - Regression. MiniMax M2 with thinking disabled emits its native
+/// `<minimax:tool_call>` XML directly. The first non-whitespace byte is `<`, so
+/// the classifier must pick NATIVE and replay the buffer into the v1 jail
+/// untouched: the tool call still extracts cleanly, no markup leaks into
+/// content, and the turn terminates with `finish_reason=ToolCalls`.
+#[tokio::test]
+async fn route_matrix_minimax_m2_required_native_xml_stays_native() {
+    let preprocessor = build_preprocessor(Some("minimax_m2"), Some("minimax_m2"));
+    let mut request = streaming_tool_request(ChatCompletionToolChoiceOption::Required);
+    request.chat_template_args =
+        Some(serde_json::from_value(serde_json::json!({"thinking": false})).unwrap());
+    let tool_call = "<minimax:tool_call>\
+<invoke name=\"get_weather\"><parameter name=\"location\">San Francisco</parameter></invoke>\
+</minimax:tool_call>";
+    let input_stream = stream::iter(
+        vec![mock_content_chunk(tool_call), mock_final_chunk()]
+            .into_iter()
+            .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, false, false)
+        .expect("postprocessor_parsing_stream should build");
+    let DrainOutput {
+        reasoning,
+        content,
+        tool_calls,
+        finish_reasons,
+    } = drain_stream(output_stream).await;
+
+    let case = "row 1: minimax_m2 + required + native XML";
+    assert!(
+        reasoning.is_empty(),
+        "{case}: native markup must not become reasoning_content, got: {reasoning:?}"
+    );
+    assert!(
+        !content.contains("minimax:tool_call"),
+        "{case}: native markup must not leak into content, got: {content:?}"
+    );
+    assert_clean_tool_call(case, &content, &tool_calls, "San Francisco");
+    assert!(
+        finish_reasons.contains(&FinishReason::ToolCalls),
+        "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
+    );
+}
+
+/// Row 2 - Same NATIVE classification, but reasoning precedes the XML. The
+/// classifier sees `I` (not `[`/`{`), routes NATIVE, and the replayed buffer
+/// still splits at `</think>`: reasoning lands in `reasoning_content`, the tool
+/// call is extracted, and neither the think markers nor the XML leak.
+#[tokio::test]
+async fn route_matrix_minimax_m2_required_reasoning_before_native_xml_stays_native() {
+    let preprocessor = build_preprocessor(Some("minimax_m2"), Some("minimax_m2"));
+    let request = streaming_tool_request(ChatCompletionToolChoiceOption::Required);
+    let tool_call = "<minimax:tool_call>\
+<invoke name=\"get_weather\"><parameter name=\"location\">San Francisco</parameter></invoke>\
+</minimax:tool_call>";
+    let input_stream = stream::iter(
+        vec![
+            mock_content_chunk("I should call weather."),
+            mock_content_chunk("</think>"),
+            mock_content_chunk(tool_call),
+            mock_final_chunk(),
+        ]
+        .into_iter()
+        .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, true, false)
+        .expect("postprocessor_parsing_stream should build");
+    let DrainOutput {
+        reasoning,
+        content,
+        tool_calls,
+        finish_reasons,
+    } = drain_stream(output_stream).await;
+
+    let case = "row 2: minimax_m2 + required + reasoning before native XML";
+    assert_eq!(
+        reasoning, "I should call weather.",
+        "{case}: reasoning_content should hold only the pre-</think> text"
+    );
+    assert!(
+        !content.contains("minimax:tool_call"),
+        "{case}: native markup must not leak into content, got: {content:?}"
+    );
+    assert_clean_tool_call(case, &content, &tool_calls, "San Francisco");
+    assert!(
+        finish_reasons.contains(&FinishReason::ToolCalls),
+        "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
+    );
+}
+
+/// Row 3 - `tool_choice=Required` with a guided JSON array payload. The first
+/// non-whitespace byte is `[`, so the request streams as guided JSON even though
+/// the model family (`qwen3_coder`) has a native markup parser configured. The
+/// tool call is extracted, arguments are valid JSON, and nothing leaks.
+#[tokio::test]
+async fn route_matrix_qwen3_coder_required_guided_json_array_routes_guided() {
+    let guided = r#"[{"name": "get_weather", "parameters": {"location": "San Francisco"}}]"#;
+    let preprocessor = build_preprocessor(None, Some("qwen3_coder"));
+    let request = streaming_tool_request(ChatCompletionToolChoiceOption::Required);
+    let input_stream = stream::iter(
+        vec![mock_content_chunk(guided), mock_final_chunk()]
+            .into_iter()
+            .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, true, false)
+        .expect("postprocessor_parsing_stream should build");
+    let DrainOutput {
+        reasoning,
+        content,
+        tool_calls,
+        finish_reasons,
+    } = drain_stream(output_stream).await;
+
+    let case = "row 3: qwen3_coder + required + guided JSON array";
+    assert!(
+        reasoning.is_empty(),
+        "{case}: guided JSON must not become reasoning_content, got: {reasoning:?}"
+    );
+    assert!(
+        content.trim().is_empty(),
+        "{case}: guided JSON must be fully consumed, content should be empty, got: {content:?}"
+    );
+    assert_clean_tool_call(case, &content, &tool_calls, "San Francisco");
+    assert!(
+        finish_reasons.contains(&FinishReason::ToolCalls),
+        "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
+    );
+}
+
+/// Row 4 - `tool_choice=Named` with a bare guided arguments object. The first
+/// non-whitespace byte is `{`, so the stream routes as guided JSON; the payload
+/// carries only the arguments, so the function name must come from the request's
+/// named tool choice.
+#[tokio::test]
+async fn route_matrix_qwen3_coder_named_bare_arguments_object_routes_guided() {
+    let bare_params = r#"{"location": "San Francisco"}"#;
+    let preprocessor = build_preprocessor(None, Some("qwen3_coder"));
+    let request = streaming_tool_request(ChatCompletionToolChoiceOption::Named(
+        ChatCompletionNamedToolChoice {
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionName {
+                name: "get_weather".to_string(),
+            },
+        },
+    ));
+    let input_stream = stream::iter(
+        vec![mock_content_chunk(bare_params), mock_final_chunk()]
+            .into_iter()
+            .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, true, false)
+        .expect("postprocessor_parsing_stream should build");
+    let DrainOutput {
+        reasoning,
+        content,
+        tool_calls,
+        finish_reasons,
+    } = drain_stream(output_stream).await;
+
+    let case = "row 4: qwen3_coder + named + bare guided arguments object";
+    assert!(
+        reasoning.is_empty(),
+        "{case}: guided JSON must not become reasoning_content, got: {reasoning:?}"
+    );
+    assert!(
+        content.trim().is_empty(),
+        "{case}: guided JSON must be fully consumed, content should be empty, got: {content:?}"
+    );
+    // The name is NOT in the payload; it can only come from the named tool choice.
+    assert_clean_tool_call(case, &content, &tool_calls, "San Francisco");
+    assert!(
+        finish_reasons.contains(&FinishReason::ToolCalls),
+        "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
+    );
+}
+
+/// Row 5 - Leading whitespace before the guided payload. The classifier skips
+/// whitespace and decides on the first REAL byte (`[`), so the request still
+/// routes as guided JSON and the whitespace never reaches the client.
+#[tokio::test]
+async fn route_matrix_qwen3_coder_required_leading_whitespace_still_guided() {
+    let guided =
+        "  \n\t [{\"name\": \"get_weather\", \"parameters\": {\"location\": \"San Francisco\"}}]";
+    let preprocessor = build_preprocessor(None, Some("qwen3_coder"));
+    let request = streaming_tool_request(ChatCompletionToolChoiceOption::Required);
+    let input_stream = stream::iter(
+        vec![mock_content_chunk(guided), mock_final_chunk()]
+            .into_iter()
+            .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, true, false)
+        .expect("postprocessor_parsing_stream should build");
+    let DrainOutput {
+        reasoning,
+        content,
+        tool_calls,
+        finish_reasons,
+    } = drain_stream(output_stream).await;
+
+    let case = "row 5: qwen3_coder + required + leading whitespace + guided JSON array";
+    assert!(
+        reasoning.is_empty(),
+        "{case}: guided JSON must not become reasoning_content, got: {reasoning:?}"
+    );
+    assert!(
+        content.trim().is_empty(),
+        "{case}: guided JSON must be fully consumed, content should be empty, got: {content:?}"
+    );
+    assert_clean_tool_call(case, &content, &tool_calls, "San Francisco");
+    assert!(
+        finish_reasons.contains(&FinishReason::ToolCalls),
+        "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
+    );
+}
+
+/// Row 6 - Native markup whose TEXT contains a `{` after the opening tag. The
+/// classifier looks only at the first non-whitespace byte (`<`), so this must be
+/// classified NATIVE and handled by the v1 jail. The inner brace stays part of
+/// the parameter value; it must never be reinterpreted as tool arguments, and the
+/// markup must not leak into content.
+#[tokio::test]
+async fn route_matrix_minimax_m2_required_native_xml_with_inner_brace_stays_native() {
+    let preprocessor = build_preprocessor(Some("minimax_m2"), Some("minimax_m2"));
+    let mut request = streaming_tool_request(ChatCompletionToolChoiceOption::Required);
+    request.chat_template_args =
+        Some(serde_json::from_value(serde_json::json!({"thinking": false})).unwrap());
+    // The `{` appears well after the first byte and inside a parameter value.
+    let tool_call = "<minimax:tool_call>\
+<invoke name=\"get_weather\"><parameter name=\"location\">San Francisco {CA}</parameter></invoke>\
+</minimax:tool_call>";
+    let input_stream = stream::iter(
+        vec![mock_content_chunk(tool_call), mock_final_chunk()]
+            .into_iter()
+            .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, false, false)
+        .expect("postprocessor_parsing_stream should build");
+    let DrainOutput {
+        reasoning,
+        content,
+        tool_calls,
+        finish_reasons,
+    } = drain_stream(output_stream).await;
+
+    let case = "row 6: minimax_m2 + required + native XML containing a later `{`";
+    assert!(
+        reasoning.is_empty(),
+        "{case}: native markup must not become reasoning_content, got: {reasoning:?}"
+    );
+    assert!(
+        !content.contains("minimax:tool_call") && !content.contains('{'),
+        "{case}: native markup must not leak into content, got: {content:?}"
+    );
+    // The brace is data, not structure: it stays inside the argument value.
+    assert_clean_tool_call(case, &content, &tool_calls, "San Francisco {CA}");
+    assert!(
+        finish_reasons.contains(&FinishReason::ToolCalls),
+        "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
+    );
+}
+
+/// Row 7 - The guided payload is split across chunks and the FIRST chunk is
+/// whitespace only. The classifier must stay undecided across that chunk
+/// boundary (emitting nothing) and commit on the `[` that arrives in a later
+/// chunk, then stream the reassembled payload as guided JSON.
+#[tokio::test]
+async fn route_matrix_qwen3_coder_required_whitespace_only_first_chunk_defers_classification() {
+    let preprocessor = build_preprocessor(None, Some("qwen3_coder"));
+    let request = streaming_tool_request(ChatCompletionToolChoiceOption::Required);
+    let input_stream = stream::iter(
+        vec![
+            mock_content_chunk(" \n "),
+            mock_content_chunk("  "),
+            mock_content_chunk("[{\"name\": \"get_weather\", "),
+            mock_content_chunk("\"parameters\": {\"location\": "),
+            mock_content_chunk("\"San Francisco\"}}]"),
+            mock_final_chunk(),
+        ]
+        .into_iter()
+        .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, true, false)
+        .expect("postprocessor_parsing_stream should build");
+    let DrainOutput {
+        reasoning,
+        content,
+        tool_calls,
+        finish_reasons,
+    } = drain_stream(output_stream).await;
+
+    let case = "row 7: qwen3_coder + required + whitespace-only first chunk + split guided JSON";
+    assert!(
+        reasoning.is_empty(),
+        "{case}: guided JSON must not become reasoning_content, got: {reasoning:?}"
+    );
+    assert!(
+        content.trim().is_empty(),
+        "{case}: guided JSON must be fully consumed, content should be empty, got: {content:?}"
+    );
+    assert_clean_tool_call(case, &content, &tool_calls, "San Francisco");
+    assert!(
+        finish_reasons.contains(&FinishReason::ToolCalls),
+        "{case}: expected ToolCalls finish_reason, got: {finish_reasons:?}"
+    );
+}
+
+/// Row 8: NAMED choice + native markup whose text contains a later `{`.
+///
+/// This is the row that actually pins "first non-whitespace byte only". A named choice
+/// looks for `{`, and native MiniMax XML frequently contains one inside a parameter
+/// value - so a classifier that scanned anywhere would mistake that brace for the start
+/// of an argument object and stream the markup as tool arguments. Row 6 cannot catch
+/// this: it is a `required` row, whose opener is `[`, and the XML contains no `[`.
+#[tokio::test]
+async fn route_matrix_minimax_m2_named_native_xml_with_inner_brace_stays_native() {
+    let preprocessor = build_preprocessor(Some("minimax_m2"), Some("minimax_m2"));
+    let mut request = streaming_tool_request(ChatCompletionToolChoiceOption::Named(
+        ChatCompletionNamedToolChoice {
+            r#type: ChatCompletionToolType::Function,
+            function: FunctionName {
+                name: "get_weather".to_string(),
+            },
+        },
+    ));
+    request.chat_template_args =
+        Some(serde_json::from_value(serde_json::json!({"thinking": false})).unwrap());
+    let tool_call = "<minimax:tool_call>\
+<invoke name=\"get_weather\"><parameter name=\"location\">San Francisco {CA}</parameter></invoke>\
+</minimax:tool_call>";
+    let input_stream = stream::iter(
+        vec![mock_content_chunk(tool_call), mock_final_chunk()]
+            .into_iter()
+            .map(Annotated::from_data),
+    );
+    let output_stream = preprocessor
+        .postprocessor_parsing_stream(input_stream, &request, false, false)
+        .expect("postprocessor_parsing_stream should build");
+    let DrainOutput {
+        content,
+        tool_calls,
+        ..
+    } = drain_stream(output_stream).await;
+
+    let case = "row 8: minimax_m2 + named + native XML containing an inner brace";
+    assert!(
+        !content.contains("minimax:tool_call"),
+        "{case}: native markup must not leak into content, got: {content:?}"
+    );
+    assert_eq!(tool_calls.len(), 1, "{case}: expected one tool call");
+    assert_eq!(
+        tool_calls[0].name.as_deref(),
+        Some("get_weather"),
+        "{case}: wrong tool name"
+    );
+    let args: serde_json::Value = serde_json::from_str(&tool_calls[0].arguments)
+        .unwrap_or_else(|e| panic!("{case}: arguments not valid JSON: {e}"));
+    assert_eq!(
+        args,
+        serde_json::json!({"location": "San Francisco {CA}"}),
+        "{case}: the inner brace must stay argument DATA, not become structure"
+    );
+}

@@ -31,7 +31,9 @@ use uuid::Uuid;
 use dynamo_parsers::tool_calling::{
     CalledFunction, ToolCallResponse, ToolCallType, ToolDefinition,
 };
-use dynamo_parsers_v2::{Tool as ToolV2, ToolCallDelta, ToolParser, create_tool_parser_for_family};
+use dynamo_parsers_v2::{
+    Tool as ToolV2, ToolCallDelta, ToolParseResult, ToolParser, create_tool_parser_for_family,
+};
 
 use super::{NvCreateChatCompletionStreamResponse, stream_choice_chunk_from_template};
 
@@ -124,18 +126,68 @@ pub(crate) fn parse_complete(
     Ok((tool_calls, result.normal_text))
 }
 
-/// Per-choice streaming state: one parser plus the set of tool indices whose
+/// How a request's tool calls reach the wire.
+///
+/// A native request runs the family's markup parser. A guided request does not: we
+/// installed the grammar that produced its output, so the shape is already known and
+/// the bytes are forwarded rather than parsed. See [`GuidedNamed`] and
+/// [`GuidedRequired`] on this enum for what "already known" means in each case.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StreamMode {
+    /// Parse the family's native tool-call markup.
+    Native { family: String },
+}
+
+/// The per-choice engine that turns upstream text into tool-call deltas.
+///
+/// The per-choice engine that turns upstream text into tool-call deltas.
+///
+/// Guided payloads are NOT handled here: the v1 jail owns them, because it also owns
+/// the native fallback a backend that ignores the grammar still needs.
+enum ChoiceProcessor {
+    Native(Box<dyn ToolParser>),
+}
+
+impl ChoiceProcessor {
+    /// Feed one upstream text delta and return the tool-call deltas it produced.
+    ///
+    /// Guided variants never fail: there is no parse to go wrong.
+    fn push(&mut self, text: &str) -> anyhow::Result<ToolParseResult> {
+        match self {
+            Self::Native(parser) => parser.push(text),
+        }
+    }
+
+    /// Terminal flush. Guided variants have nothing buffered, so this is a no-op:
+    /// every byte they received was already forwarded.
+    fn finish(&mut self) -> anyhow::Result<ToolParseResult> {
+        match self {
+            Self::Native(parser) => parser.finish(),
+        }
+    }
+}
+
+/// Per-choice streaming state: one processor plus the set of tool indices whose
 /// opening delta (id + type + function name) has already been emitted.
 struct ChoiceState {
-    parser: Box<dyn ToolParser>,
+    processor: ChoiceProcessor,
     opened: HashSet<usize>,
+    /// Whether this choice has put any tool call on the wire. Owned here rather than
+    /// in a parallel map so the terminal paths cannot disagree with the emission path.
+    tool_emitted: bool,
 }
 
 impl ChoiceState {
-    fn new(family: &str, tools: &[ToolV2]) -> anyhow::Result<Self> {
+    fn new(mode: &StreamMode, tools: &[ToolV2]) -> anyhow::Result<Self> {
+        let processor = match mode {
+            StreamMode::Native { family } => {
+                ChoiceProcessor::Native(create_tool_parser_for_family(family, tools)?)
+            }
+        };
         Ok(Self {
-            parser: create_tool_parser_for_family(family, tools)?,
+            processor,
             opened: HashSet::new(),
+            tool_emitted: false,
         })
     }
 
@@ -150,6 +202,7 @@ impl ChoiceState {
         if calls.is_empty() {
             return None;
         }
+        self.tool_emitted = true;
         let chunks = calls
             .into_iter()
             .map(|delta| {
@@ -174,7 +227,6 @@ impl ChoiceState {
 fn finish_unterminated_choices(
     states: &mut HashMap<u32, ChoiceState>,
     finished: &mut HashSet<u32>,
-    tool_emitted: &mut HashSet<u32>,
     template: &NvCreateChatCompletionStreamResponse,
 ) -> Vec<Annotated<NvCreateChatCompletionStreamResponse>> {
     let mut indices: Vec<_> = states
@@ -190,21 +242,18 @@ fn finish_unterminated_choices(
         let state = states
             .get_mut(&index)
             .expect("choice index came from parser state map");
-        let result = match state.parser.finish() {
+        let result = match state.processor.finish() {
             Ok(result) => result,
             Err(error) => {
                 tracing::warn!(error = %error, choice_index = index, "v2 stream finish failed");
-                dynamo_parsers_v2::ToolParseResult::default()
+                ToolParseResult::default()
             }
         };
         let tool_calls = state.emit_chunks(result.calls);
-        if tool_calls.is_some() {
-            tool_emitted.insert(index);
-        }
         // A choice that produced tool calls during the stream must terminate
         // with `ToolCalls` even when the backend never sent a finish_reason.
         // Text-only output without an upstream finish reason stays `None`.
-        let finish_reason = if tool_emitted.contains(&index) {
+        let finish_reason = if state.tool_emitted {
             Some(FinishReason::ToolCalls)
         } else {
             None
@@ -233,7 +282,7 @@ fn finish_unterminated_choices(
 pub(crate) fn apply_stream<S>(
     stream_in: S,
     tool_definitions: Option<Vec<ToolDefinition>>,
-    family: String,
+    mode: StreamMode,
 ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
 where
     S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
@@ -242,7 +291,9 @@ where
     stream! {
         // The caller only routes supported families here, but if a parser cannot be
         // built we pass every chunk through untouched rather than dropping output.
-        if create_tool_parser_for_family(&family, &v2_tools).is_err() {
+        if let StreamMode::Native { family } = &mode
+            && create_tool_parser_for_family(family, &v2_tools).is_err()
+        {
             tracing::warn!(family = %family, "no dynamo-parsers-v2 parser for family; passing stream through unchanged");
             tokio::pin!(stream_in);
             while let Some(response) = stream_in.next().await {
@@ -251,12 +302,17 @@ where
             return;
         }
 
+        // Stable log label for this stream: the family for native requests, the
+        // guided shape otherwise. Replaces the old `family` string, which no longer
+        // exists for guided modes.
+        let mode_label = match &mode {
+            StreamMode::Native { family } => family.clone(),
+        };
         let mut states: HashMap<u32, ChoiceState> = HashMap::new();
         // Choice indices whose finish() has already run (terminating chunk seen).
         let mut finished: HashSet<u32> = HashSet::new();
         // Choice indices that have emitted at least one tool-call chunk; used to flip a
         // `Stop` terminating reason to `ToolCalls` (OpenAI contract — see below).
-        let mut tool_emitted: HashSet<u32> = HashSet::new();
         // Last data response, kept (with choices cleared) as a template for the
         // end-of-stream flush when no finish_reason chunk arrived.
         let mut template: Option<NvCreateChatCompletionStreamResponse> = None;
@@ -280,7 +336,7 @@ where
             for choice in chat_response.inner.choices.iter_mut() {
                 let state = states.entry(choice.index).or_insert_with(|| {
                     // Family validated above; construction is deterministic in-process.
-                    ChoiceState::new(&family, &v2_tools)
+                    ChoiceState::new(&mode, &v2_tools)
                         .expect("dynamo-parsers-v2 parser construction validated above")
                 });
 
@@ -293,34 +349,31 @@ where
                 let mut result = dynamo_parsers_v2::ToolParseResult::default();
                 let mut parsed_any = false;
                 if let Some(text) = text.as_deref() {
-                    match state.parser.push(text) {
+                    match state.processor.push(text) {
                         Ok(r) => {
                             result.append(r);
                             parsed_any = true;
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, family = %family, "v2 stream push failed; passing chunk through");
+                            tracing::warn!(error = %e, mode = %mode_label, "v2 stream push failed; passing chunk through");
                         }
                     }
                 }
                 // Flush on the terminating chunk so a value truncated at EOF is dropped.
                 if choice.finish_reason.is_some() && finished.insert(choice.index) {
-                    match state.parser.finish() {
+                    match state.processor.finish() {
                         Ok(r) => {
                             result.append(r);
                             parsed_any = true;
                         }
                         Err(e) => {
-                            tracing::warn!(error = %e, family = %family, "v2 stream finish failed");
+                            tracing::warn!(error = %e, mode = %mode_label, "v2 stream finish failed");
                         }
                     }
                 }
 
                 if parsed_any {
                     let tool_calls = state.emit_chunks(result.calls);
-                    if tool_calls.is_some() {
-                        tool_emitted.insert(choice.index);
-                    }
                     // The parser consumed text input, so replace content with its
                     // normal_text (None when the input was all tool markup) — raw tool
                     // markup must never reach the client. Role, reasoning and logprobs
@@ -339,7 +392,9 @@ where
                 // Runs regardless of parsed_any so a role-only terminating chunk that
                 // still carries finish_reason gets fixed.
                 if choice.finish_reason == Some(FinishReason::Stop)
-                    && tool_emitted.contains(&choice.index)
+                    && states
+                        .get(&choice.index)
+                        .is_some_and(|state| state.tool_emitted)
                 {
                     choice.finish_reason = Some(FinishReason::ToolCalls);
                 }
@@ -350,12 +405,9 @@ where
             // empty-choices response; EOF below remains the fallback when no such
             // response arrives.
             if is_empty_choices && let Some(template) = &template {
-                for terminal in finish_unterminated_choices(
-                    &mut states,
-                    &mut finished,
-                    &mut tool_emitted,
-                    template,
-                ) {
+                for terminal in
+                    finish_unterminated_choices(&mut states, &mut finished, template)
+                {
                     yield terminal;
                 }
             }
@@ -368,12 +420,7 @@ where
         // or when the choice already emitted tool calls and still needs a terminal
         // `ToolCalls` reason.
         if let Some(template) = &template {
-            for terminal in finish_unterminated_choices(
-                &mut states,
-                &mut finished,
-                &mut tool_emitted,
-                template,
-            ) {
+            for terminal in finish_unterminated_choices(&mut states, &mut finished, template) {
                 yield terminal;
             }
         }
@@ -532,9 +579,15 @@ mod tests {
             .collect();
         chunks.push(chunk("", true));
 
-        let out: Vec<_> = apply_stream(stream::iter(chunks), None, "qwen3_coder".to_string())
-            .collect::<Vec<_>>()
-            .await;
+        let out: Vec<_> = apply_stream(
+            stream::iter(chunks),
+            None,
+            StreamMode::Native {
+                family: "qwen3_coder".to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
 
         let (calls, content) = reassemble(&out);
         assert_eq!(calls.len(), 1, "expected exactly one tool call: {calls:?}");
@@ -563,9 +616,15 @@ mod tests {
         let truncated = "<tool_call>\n<function=get_weather>\n<parameter=location>\nPar";
         let chunks = vec![chunk(truncated, false), chunk("", true)];
 
-        let out: Vec<_> = apply_stream(stream::iter(chunks), None, "qwen3_coder".to_string())
-            .collect::<Vec<_>>()
-            .await;
+        let out: Vec<_> = apply_stream(
+            stream::iter(chunks),
+            None,
+            StreamMode::Native {
+                family: "qwen3_coder".to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
 
         let (calls, content) = reassemble(&out);
         let complete: Vec<_> = calls.iter().filter(|(n, _)| !n.is_empty()).collect();
@@ -600,9 +659,15 @@ mod tests {
             .collect();
         chunks.push(chunk("", true));
 
-        let out: Vec<_> = apply_stream(stream::iter(chunks), None, "deepseek_v4".to_string())
-            .collect::<Vec<_>>()
-            .await;
+        let out: Vec<_> = apply_stream(
+            stream::iter(chunks),
+            None,
+            StreamMode::Native {
+                family: "deepseek_v4".to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
 
         let (calls, content) = reassemble(&out);
         let complete: Vec<_> = calls.iter().filter(|(n, _)| !n.is_empty()).collect();
@@ -643,9 +708,15 @@ mod tests {
         // A usage-only chunk arrives without any terminating choice.
         chunks.push(usage_chunk());
 
-        let out: Vec<_> = apply_stream(stream::iter(chunks), None, "qwen3_coder".to_string())
-            .collect::<Vec<_>>()
-            .await;
+        let out: Vec<_> = apply_stream(
+            stream::iter(chunks),
+            None,
+            StreamMode::Native {
+                family: "qwen3_coder".to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
 
         let (calls, _content) = reassemble(&out);
         assert_eq!(calls.len(), 1, "expected exactly one tool call: {calls:?}");
@@ -709,9 +780,15 @@ mod tests {
     async fn qwen3_bypass_does_not_synthesize_finish_reason_for_text_only_stream() {
         let chunks = vec![chunk("hello world", false), chunk("", false)];
 
-        let out: Vec<_> = apply_stream(stream::iter(chunks), None, "qwen3_coder".to_string())
-            .collect::<Vec<_>>()
-            .await;
+        let out: Vec<_> = apply_stream(
+            stream::iter(chunks),
+            None,
+            StreamMode::Native {
+                family: "qwen3_coder".to_string(),
+            },
+        )
+        .collect::<Vec<_>>()
+        .await;
 
         let (calls, _content) = reassemble(&out);
         assert!(calls.is_empty(), "no tool calls expected: {calls:?}");
@@ -727,16 +804,16 @@ mod tests {
         let mut states = HashMap::from([(
             3,
             ChoiceState {
-                parser: Box::new(FinishErrorParser),
+                processor: ChoiceProcessor::Native(Box::new(FinishErrorParser)),
                 opened: HashSet::new(),
+                // This choice already put a call on the wire earlier in the stream.
+                tool_emitted: true,
             },
         )]);
         let mut finished = HashSet::new();
-        let mut tool_emitted = HashSet::from([3]);
         let template = usage_chunk().data.expect("usage response data");
 
-        let responses =
-            finish_unterminated_choices(&mut states, &mut finished, &mut tool_emitted, &template);
+        let responses = finish_unterminated_choices(&mut states, &mut finished, &template);
 
         assert_eq!(
             responses.len(),

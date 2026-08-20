@@ -3117,6 +3117,40 @@ impl OpenAIPreprocessor {
     where
         S: Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send + 'static,
     {
+        use crate::protocols::openai::chat_completions::unified_parser;
+
+        // When a request's parser pair has a unified parser and it is switched on, ONE
+        // state machine owns reasoning + text + tool calls for the whole stream. It
+        // replaces everything below — the reasoning-parser stage AND the tool-call jail
+        // — because the ordering it recovers is exactly what is lost at the seam
+        // between those two stages.
+        if let Some(family) = unified_parser::selected_family(
+            self.tool_call_parser.as_deref(),
+            self.runtime_config.reasoning_parser.as_deref(),
+        ) {
+            let tool_definitions = request.inner.tools.as_ref().map(|tools| {
+                tools
+                    .iter()
+                    .map(|tool| dynamo_parsers::tool_calling::ToolDefinition {
+                        name: tool.function.name.clone(),
+                        parameters: tool.function.parameters.clone(),
+                        strict: tool.function.strict,
+                    })
+                    .collect()
+            });
+            return Ok(Box::pin(unified_parser::apply_stream(
+                stream,
+                tool_definitions,
+                request.inner.tool_choice.clone(),
+                uses_tool_call_structural_tag,
+                unified_parser::stream_prefill(family, prompt_injected_reasoning),
+                family,
+            ))
+                as Pin<
+                    Box<dyn Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send>,
+                >);
+        }
+
         // Guided output may be bare JSON or `reasoning</think>JSON`. Supported
         // parsers inspect the stream shape before deciding whether to parse it.
         let is_guided_tool_choice = matches!(
@@ -3272,7 +3306,22 @@ impl OpenAIPreprocessor {
         // tool_choice=required/named and structural-tag still use the jail's
         // Immediate mode, since those rely on guided-decoded JSON rather than the
         // native markup the v2 parser reads. See tool_parser_v2::apply_stream.
+        use crate::preprocessor::tool_choice::guided_tool_constraint;
         use crate::protocols::openai::chat_completions::tool_parser_v2;
+
+        // Guided JSON does NOT go to the jail. We installed the grammar that produced
+        // this output, so the shape is already known: a named choice's payload is the
+        // argument object itself, and a required choice's is an array of
+        // `{name, parameters}`. Routing comes from the SHARED constraint predicate, not
+        // from `tool_choice`, because a Kimi K3 forced request is indistinguishable
+        // there yet installs no JSON schema at all.
+        let guided = guided_tool_constraint(
+            request,
+            effective_tool_call_parser.as_deref(),
+            self.runtime_config.reasoning_parser.as_deref(),
+            uses_tool_call_structural_tag,
+        );
+
         let parser_name = effective_tool_call_parser.as_deref();
         let use_parsers_v2 = tool_parser_v2::enabled()
             && parser_name.is_some_and(tool_parser_v2::supports_family)
@@ -3288,16 +3337,23 @@ impl OpenAIPreprocessor {
                 Box::pin(tool_parser_v2::apply_stream(
                     stream,
                     tool_definitions,
-                    parser_name
-                        .expect("use_parsers_v2 implies a parser name")
-                        .to_string(),
+                    tool_parser_v2::StreamMode::Native {
+                        family: parser_name
+                            .expect("use_parsers_v2 implies a parser name")
+                            .to_string(),
+                    },
                 ))
             } else if should_jail {
+                // A forced tool_choice installed a JSON grammar, so the jail may release
+                // calls as they arrive instead of buffering to the closing brace. The
+                // jail keeps its own native fallback, so a backend that ignores the
+                // grammar (MiniMax M2 emits XML under `required`) still parses normally.
                 Box::pin(Self::apply_tool_calling_jail(
                     effective_tool_call_parser,
                     request.inner.tool_choice.clone(),
                     tool_definitions,
                     uses_tool_call_structural_tag,
+                    guided.installs_guided_json(),
                     stream,
                 ))
             } else {
@@ -3812,6 +3868,7 @@ impl OpenAIPreprocessor {
         tool_choice: Option<dynamo_protocols::types::ChatCompletionToolChoiceOption>,
         tool_definitions: Option<Vec<dynamo_parsers::tool_calling::ToolDefinition>>,
         uses_tool_call_structural_tag: bool,
+        guided_streaming: bool,
         stream: S,
     ) -> impl Stream<Item = Annotated<NvCreateChatCompletionStreamResponse>> + Send
     where
@@ -3924,6 +3981,7 @@ impl OpenAIPreprocessor {
             tool_choice,
             tool_definitions,
             uses_tool_call_structural_tag,
+            guided_streaming,
             jail_input,
         )
         .flat_map(move |a| {
@@ -5023,11 +5081,12 @@ impl
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
 
-        let uses_tool_call_structural_tag = self.apply_tool_choice_guided_decoding(
+        let guided_tool_constraint = self.apply_tool_choice_guided_decoding(
             &request,
             &mut common_request,
             prompt_injected_reasoning,
         )?;
+        let uses_tool_call_structural_tag = guided_tool_constraint.uses_structural_tag();
 
         tracing::trace!(request = ?common_request, prompt_injected_reasoning, "Pre-processed request");
         let trace_state = crate::request_trace::build_request_end_trace_state(
@@ -5498,6 +5557,8 @@ mod tests {
             Some("kimi_k3".to_string()),
             request.inner.tool_choice.clone(),
             None,
+            false,
+            // No tools and no forced choice, so no JSON grammar was installed.
             false,
             stream::iter(vec![
                 kimi_k3_reasoning_chunk(leaked_reasoning),
