@@ -81,6 +81,10 @@ impl HealthCheckManager {
         let manager = self.clone();
         let canary_wait = self.config.canary_wait_time;
         let endpoint_subject_clone = endpoint_subject.clone();
+        // Tied to the runtime's endpoint-shutdown phase: once shutdown
+        // begins, generating new canaries against unregistering endpoints
+        // is wrong, and this task must not outlive the runtime.
+        let cancel_token = self.drt.child_token();
 
         // Get the endpoint-specific notifier
         let notifier = self
@@ -95,8 +99,13 @@ impl HealthCheckManager {
             info!("Health check task started for: {}", endpoint_subject);
 
             loop {
-                // Wait for either timeout or activity notification
+                // Wait for shutdown, timeout, or activity notification
                 tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!("Runtime shutting down; stopping health check task for {}", endpoint_subject);
+                        break;
+                    }
+
                     _ = tokio::time::sleep(canary_wait) => {
                         // Timeout - send health check for this specific endpoint
                         debug!("Canary timer expired for {}, sending health check", endpoint_subject);
@@ -160,10 +169,21 @@ impl HealthCheckManager {
                 anyhow::anyhow!("Endpoint receiver already taken - this should only be called once")
             })?;
 
+        let cancel_token = self.drt.child_token();
         tokio::spawn(async move {
             info!("Starting dynamic endpoint discovery monitor with channel-based notifications");
 
-            while let Some(endpoint_subject) = rx.recv().await {
+            loop {
+                let endpoint_subject = tokio::select! {
+                    _ = cancel_token.cancelled() => {
+                        debug!("Runtime shutting down; stopping endpoint discovery monitor");
+                        break;
+                    }
+                    received = rx.recv() => match received {
+                        Some(endpoint_subject) => endpoint_subject,
+                        None => break,
+                    },
+                };
                 debug!(
                     "Received endpoint registration via channel: {}",
                     endpoint_subject
@@ -854,5 +874,100 @@ mod integration_tests {
             .lock()
             .get_endpoint_health_status(endpoint);
         assert_eq!(status, Some(HealthStatus::NotReady));
+    }
+
+    // =================================================================
+    // Health-check tasks must stop on runtime shutdown (#13410)
+    // =================================================================
+
+    use crate::component::{Instance, TransportType};
+    use crate::engine::AsyncEngineContextProvider;
+    use crate::local_endpoint_registry::LocalAsyncEngine;
+    use crate::pipeline::{ManyOut, ResponseStream};
+    use crate::protocols::annotated::Annotated;
+    use async_trait::async_trait;
+    use futures::stream;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Canary engine that completes immediately and counts how many canaries
+    /// it has served.
+    struct CountingCanaryEngine {
+        canaries_issued: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl
+        AsyncEngine<
+            SingleIn<serde_json::Value>,
+            ManyOut<Annotated<serde_json::Value>>,
+            anyhow::Error,
+        > for CountingCanaryEngine
+    {
+        async fn generate(
+            &self,
+            input: SingleIn<serde_json::Value>,
+        ) -> anyhow::Result<ManyOut<Annotated<serde_json::Value>>> {
+            let (_data, ctx) = input.into_parts();
+            self.canaries_issued.fetch_add(1, Ordering::SeqCst);
+            let chunks = vec![Annotated::from_data(serde_json::json!({"ok": true}))];
+            Ok(ResponseStream::new(
+                Box::pin(stream::iter(chunks)),
+                ctx.context(),
+            ))
+        }
+    }
+
+    /// Health-check tasks must observe runtime shutdown: after
+    /// `Runtime::shutdown`, no further canaries may be issued.
+    #[tokio::test]
+    async fn test_health_check_tasks_stop_on_runtime_shutdown() {
+        let drt = create_test_drt_async().await;
+        let endpoint = "shutdown_stops_canaries";
+        let canaries_issued = Arc::new(AtomicUsize::new(0));
+
+        drt.system_health().lock().register_health_check_target(
+            endpoint,
+            Instance {
+                component: "test_component".to_string(),
+                endpoint: endpoint.to_string(),
+                namespace: "test_namespace".to_string(),
+                instance_id: 0,
+                transport: TransportType::Nats(endpoint.to_string()),
+                device_type: None,
+                request_plane_codec: None,
+            },
+            serde_json::json!({"_health_check": true}),
+        );
+        let engine: LocalAsyncEngine = Arc::new(CountingCanaryEngine {
+            canaries_issued: canaries_issued.clone(),
+        });
+        drt.local_endpoint_registry()
+            .register(endpoint.to_string(), engine);
+
+        let config = HealthCheckConfig {
+            canary_wait_time: Duration::from_millis(200),
+            request_timeout: Duration::from_secs(1),
+        };
+        let manager = Arc::new(HealthCheckManager::new(drt.clone(), config));
+        manager.start().await.unwrap();
+
+        // Prove the canary loop is live before shutdown.
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        assert!(
+            canaries_issued.load(Ordering::SeqCst) >= 2,
+            "canaries should fire before shutdown"
+        );
+
+        drt.runtime().shutdown();
+
+        // Allow in-flight ticks to settle, then require the count to freeze.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let after_settle = canaries_issued.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert_eq!(
+            canaries_issued.load(Ordering::SeqCst),
+            after_settle,
+            "no canaries may fire after runtime shutdown"
+        );
     }
 }
